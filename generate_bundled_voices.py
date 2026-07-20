@@ -1,8 +1,8 @@
 """
 generate_bundled_voices.py
 
-Run this script ONCE to generate the .npy voice embeddings for the
-8 official Kyutai voices. Place the resulting .npy files in the addon's
+Run this script to generate the .npy voice embeddings listed below.
+Place the resulting .npy files in the addon's
 voices/ directory before building the .nvda-addon package.
 
 Expected directory layout (no arguments needed):

@@ -58,53 +58,90 @@ class _SynthQueueThread(threading.Thread):
             except queue.Empty:
                 continue
 
-            self.cancel_event.clear()
-            text, voice_path, indices = request  # indices is a list
-
             try:
-                if self.cancel_event.is_set() or not self.driver.tts_engine:
-                    self._finish_request(indices)
-                    continue
-
-                if text and text.strip():
-                    audio_stream = self.driver.tts_engine.stream(
-                        text=text,
-                        voice=voice_path,
-                        target_buffer_sec=0.2,
-                    )
-
-                    volume_factor = self.driver._volume / 100.0
-
-                    for chunk in audio_stream:
-                        if self.cancel_event.is_set():
-                            break
-                        if chunk is not None and self.driver._player:
-                            pcm = np.clip(chunk * volume_factor, -1.0, 1.0)
-                            self.driver._player.feed(
-                                (pcm * 32767).astype(np.int16).tobytes()
-                            )
-
-                # Wait for the WavePlayer buffer to drain before signalling
-                # completion. Without this the next utterance starts while
-                # audio is still playing, cutting off the end of the sentence.
-                if self.driver._player and not self.cancel_event.is_set():
-                    try:
-                        self.driver._player.waitDone()
-                    except Exception:
-                        pass
-                self._finish_request(indices)
+                self._process_request(request)
             except Exception as e:
                 log.error(f"Pocket TTS ONNX: Synthesis error: {e}")
-                self._finish_request(indices)
+                try:
+                    gen, _text, _voice_path, indices = request
+                    self._notify_finished(gen, indices)
+                finally:
+                    self.driver._request_queue.task_done()
+            else:
+                self.driver._request_queue.task_done()
 
         ctypes.windll.ole32.CoUninitialize()
 
-    def _finish_request(self, indices):
-        if not self.cancel_event.is_set():
-            for idx in (indices or []):
-                synthIndexReached.notify(synth=self.driver, index=idx)
-            synthDoneSpeaking.notify(synth=self.driver)
-        self.driver._request_queue.task_done()
+    def _notify_finished(self, gen, indices):
+        if gen != self.driver._speech_gen:
+            return
+        for idx in (indices or []):
+            synthIndexReached.notify(synth=self.driver, index=idx)
+        synthDoneSpeaking.notify(synth=self.driver)
+
+    def _process_request(self, request):
+        driver = self.driver
+        gen, text, voice_path, indices = request
+        if gen != driver._speech_gen:
+            return
+
+        self.cancel_event.clear()
+        if gen != driver._speech_gen or self.cancel_event.is_set() or not driver.tts_engine:
+            self._notify_finished(gen, indices)
+            return
+
+        tracker = {"final": None, "played": 0, "fired": False}
+        lock = threading.Lock()
+
+        def make_on_done(seq):
+            def on_done():
+                if gen != driver._speech_gen:
+                    return
+                with lock:
+                    if seq > tracker["played"]:
+                        tracker["played"] = seq
+                    if tracker["final"] is None or tracker["played"] < tracker["final"] or tracker["fired"]:
+                        return
+                    tracker["fired"] = True
+                self._notify_finished(gen, indices)
+            return on_done
+
+        fed = 0
+        if text and text.strip():
+            audio_stream = driver.tts_engine.stream(
+                text=text,
+                voice=voice_path,
+                target_buffer_sec=0.2,
+                cancel_event=self.cancel_event,
+            )
+            volume_factor = driver._volume / 100.0
+
+            for chunk in audio_stream:
+                if self.cancel_event.is_set() or gen != driver._speech_gen:
+                    break
+                if chunk is not None and driver._player:
+                    pcm = np.clip(chunk * volume_factor, -1.0, 1.0)
+                    fed += 1
+                    driver._player.feed(
+                        (pcm * 32767).astype(np.int16).tobytes(),
+                        onDone=make_on_done(fed),
+                    )
+
+        if self.cancel_event.is_set() or gen != driver._speech_gen:
+            return
+
+        if fed == 0:
+            self._notify_finished(gen, indices)
+            return
+
+        fire_now = False
+        with lock:
+            tracker["final"] = fed
+            if tracker["played"] >= fed and not tracker["fired"]:
+                tracker["fired"] = True
+                fire_now = True
+        if fire_now:
+            self._notify_finished(gen, indices)
 
 
 # =========================================================================
@@ -139,11 +176,13 @@ class SynthDriver(BaseSynthDriver):
         self._current_voice_path = None  # str path passed directly to the engine
         self._volume = 80
         self._eos_threshold = -2.0
+        self._lsd_steps = 1
         self.tts_engine = None
         self._player = None
         self._available_voices = OrderedDict()
         self._request_queue = queue.Queue()
         self._engine_loaded_event = threading.Event()
+        self._speech_gen = 0
 
         self._scan_voices()
         self._worker_thread = _SynthQueueThread(driver=self)
@@ -163,6 +202,14 @@ class SynthDriver(BaseSynthDriver):
             minVal=0,
             maxVal=100,
         ),
+        NumericDriverSetting(
+            "lsdSteps",
+            # Translators: Label for the Pocket TTS flow matching step setting in NVDA speech settings
+            _("Flow steps"),
+            availableInSettingsRing=True,
+            minVal=1,
+            maxVal=5,
+        ),
     )
 
     def _scan_voices(self):
@@ -177,7 +224,7 @@ class SynthDriver(BaseSynthDriver):
             name, ext = os.path.splitext(os.path.basename(path))
             if name not in seen:
                 self._available_voices[name] = VoiceInfo(
-                    name, name.replace("_", " ").title()
+                    name, name.replace("_", " ").title(), "en"
                 )
                 seen.add(name)
 
@@ -208,7 +255,7 @@ class SynthDriver(BaseSynthDriver):
                 models_dir=self.models_dir,
                 tokenizer_path=self.tokenizer_path,
                 precision="int8",
-                lsd_steps=1,
+                lsd_steps=self._lsd_steps,
                 eos_threshold=self._eos_threshold,
             )
             self._engine_loaded_event.set()
@@ -254,6 +301,16 @@ class SynthDriver(BaseSynthDriver):
         if self.tts_engine is not None:
             self.tts_engine.eos_threshold = self._eos_threshold
 
+    # --- Flow steps property ---
+
+    def _get_lsdSteps(self):
+        return self._lsd_steps
+
+    def _set_lsdSteps(self, value):
+        self._lsd_steps = max(1, min(5, int(value)))
+        if self.tts_engine is not None:
+            self.tts_engine.set_lsd_steps(self._lsd_steps)
+
     # --- Speech ---
 
     def speak(self, speechSequence):
@@ -287,7 +344,7 @@ class SynthDriver(BaseSynthDriver):
 
         full_text = "".join(text_parts)
         if full_text.strip() or pending_indices:
-            self._request_queue.put((full_text, self._current_voice_path, pending_indices))
+            self._request_queue.put((self._speech_gen, full_text, self._current_voice_path, pending_indices))
 
     def pause(self, switch):
         """Pause or resume playback. Called by NVDA when the user presses Shift."""
@@ -298,6 +355,7 @@ class SynthDriver(BaseSynthDriver):
                 pass
 
     def cancel(self):
+        self._speech_gen += 1
         self._worker_thread.cancel_event.set()
         if self._player:
             try:
@@ -312,7 +370,14 @@ class SynthDriver(BaseSynthDriver):
                 break
 
     def terminate(self):
+        self._speech_gen += 1
+        self._worker_thread.cancel_event.set()
         self._worker_thread.stop_event.set()
+        if self._player:
+            try:
+                self._player.stop()
+            except Exception:
+                pass
         # Join the worker thread before releasing resources so it cannot
         # access _player or tts_engine after they have been freed.
         self._worker_thread.join(timeout=2.0)

@@ -30,7 +30,6 @@ Usage:
 import os
 import queue
 import threading
-import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Generator, Optional, Union
@@ -123,6 +122,11 @@ class PocketTTSOnnx:
         # unbounded growth when many voices are used in a session.
         self._voice_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
         self._voice_cache_max = 8
+        # Cache the transformer state after the voice-conditioning pass.
+        # This state depends only on the selected voice, so reusing a copy
+        # removes a large per-utterance cost during typing and input help.
+        self._voice_state_cache: "OrderedDict[str, dict]" = OrderedDict()
+        self._voice_state_cache_max = 3
 
     def _get_providers(self, device: str) -> list:
         """Get ONNX execution providers based on device setting."""
@@ -136,18 +140,23 @@ class PocketTTSOnnx:
                 return ["CUDAExecutionProvider", "CPUExecutionProvider"]
             return ["CPUExecutionProvider"]
 
-    def _make_session_options(self) -> ort.SessionOptions:
+    def _make_session_options(self, num_threads: int, allow_spinning: bool = True) -> ort.SessionOptions:
         """Create optimized session options for ONNX inference.
 
         Caps intra-op threads to avoid over-subscription overhead on the
-        small sequential matmuls in the autoregressive loop.  The sweet
-        spot on a 16-core machine is 3-8; we use min(cpu_count, 4) so
-        low-core machines aren't over-committed and high-core machines
-        don't hit the contention cliff.
+        small sequential matmuls in the autoregressive loop. Flow models keep
+        spinning enabled for latency; helper and decoder sessions use fewer
+        threads and can yield CPU time to NVDA and the audio thread.
         """
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = min(os.cpu_count() or 4, 4)
+        opts.intra_op_num_threads = max(1, int(num_threads))
         opts.inter_op_num_threads = 1
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        if not allow_spinning:
+            try:
+                opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            except Exception:
+                pass
         return opts
 
     def _load_models(self):
@@ -158,28 +167,31 @@ class PocketTTSOnnx:
         flow_flow_file = f"flow_lm_flow{suffix}.onnx"
         mimi_file = f"mimi_decoder{suffix}.onnx"
 
-        sess_opts = self._make_session_options()
+        cpu = os.cpu_count() or 4
+        flow_opts = self._make_session_options(min(cpu, 4), allow_spinning=True)
+        mimi_opts = self._make_session_options(2 if cpu > 4 else 1, allow_spinning=False)
+        aux_opts = self._make_session_options(min(cpu, 2), allow_spinning=False)
 
         self.mimi_encoder = ort.InferenceSession(
             str(self.models_dir / "mimi_encoder.onnx"),
-            sess_options=sess_opts, providers=self.providers
+            sess_options=aux_opts, providers=self.providers
         )
         self.text_conditioner = ort.InferenceSession(
             str(self.models_dir / "text_conditioner.onnx"),
-            sess_options=sess_opts, providers=self.providers
+            sess_options=aux_opts, providers=self.providers
         )
         # Dual model split: main (transformer) + flow (flow network)
         self.flow_lm_main = ort.InferenceSession(
             str(self.models_dir / flow_main_file),
-            sess_options=sess_opts, providers=self.providers
+            sess_options=flow_opts, providers=self.providers
         )
         self.flow_lm_flow = ort.InferenceSession(
             str(self.models_dir / flow_flow_file),
-            sess_options=sess_opts, providers=self.providers
+            sess_options=flow_opts, providers=self.providers
         )
         self.mimi_decoder = ort.InferenceSession(
             str(self.models_dir / mimi_file),
-            sess_options=sess_opts, providers=self.providers
+            sess_options=mimi_opts, providers=self.providers
         )
 
     def _precompute_flow_buffers(self):
@@ -193,6 +205,11 @@ class PocketTTSOnnx:
                 np.array([[s]], dtype=np.float32),
                 np.array([[t]], dtype=np.float32)
             ))
+
+    def set_lsd_steps(self, value: int):
+        """Set flow matching steps and refresh precomputed buffers."""
+        self.lsd_steps = max(1, min(5, int(value)))
+        self._precompute_flow_buffers()
 
     def _init_state(self, session: ort.InferenceSession) -> dict:
         """Initialize state tensors for a stateful model."""
@@ -271,13 +288,13 @@ class PocketTTSOnnx:
         """
         audio = self._load_audio(audio_path)
         embeddings = self.mimi_encoder.run(None, {"audio": audio})[0]
-        
+
         # Normalize dimensions to [1, N, 1024]
         while embeddings.ndim > 3:
             embeddings = embeddings.squeeze(0)
         if embeddings.ndim < 3:
             embeddings = embeddings[None]
-            
+
         return embeddings
 
     def _get_voice_embeddings(self, voice: Union[str, Path, np.ndarray]) -> np.ndarray:
@@ -320,6 +337,42 @@ class PocketTTSOnnx:
         'y': 'why', 'z': 'zee',
     }
 
+    _PUNCTUATION_NAMES = {
+        " ": "space",
+        "\t": "tab",
+        "-": "dash",
+        "\u2013": "dash",
+        "\u2014": "dash",
+        "_": "underscore",
+        ".": "dot",
+        ",": "comma",
+        ":": "colon",
+        ";": "semicolon",
+        "?": "question mark",
+        "!": "exclamation mark",
+        "'": "apostrophe",
+        '"': "quote",
+        "/": "slash",
+        "\\": "backslash",
+        "|": "bar",
+        "@": "at sign",
+        "#": "number sign",
+        "$": "dollar sign",
+        "%": "percent sign",
+        "&": "ampersand",
+        "*": "asterisk",
+        "+": "plus",
+        "=": "equals",
+        "<": "less than",
+        ">": "greater than",
+        "(": "left parenthesis",
+        ")": "right parenthesis",
+        "[": "left bracket",
+        "]": "right bracket",
+        "{": "left brace",
+        "}": "right brace",
+    }
+
     def _tokenize(self, text: str) -> np.ndarray:
         """Tokenize text for the model, with special handling for single characters."""
         text = text.strip()
@@ -335,6 +388,8 @@ class PocketTTSOnnx:
             elif letter.isdigit():
                 # Digits are fine as-is; the model handles them.
                 text = text + "."
+            elif text in self._PUNCTUATION_NAMES:
+                text = self._PUNCTUATION_NAMES[text].capitalize() + "."
             else:
                 text = text + "."
         else:
@@ -360,12 +415,42 @@ class PocketTTSOnnx:
                 idx = int(name.replace("out_state_", ""))
                 state[f"state_{idx}"] = result[i]
 
+    def _copy_state(self, state: dict) -> dict:
+        return {name: np.copy(value) for name, value in state.items()}
+
+    def _get_voice_conditioned_state(
+        self,
+        voice_key: Optional[str],
+        voice_embeddings: np.ndarray,
+        empty_seq: np.ndarray,
+    ) -> dict:
+        if voice_key and voice_key in self._voice_state_cache:
+            self._voice_state_cache.move_to_end(voice_key)
+            return self._copy_state(self._voice_state_cache[voice_key])
+
+        state = self._init_state(self.flow_lm_main)
+        res_voice = self.flow_lm_main.run(None, {
+            "sequence": empty_seq,
+            "text_embeddings": voice_embeddings,
+            **state
+        })
+        self._update_state_from_outputs(state, res_voice, self.flow_lm_main)
+
+        if voice_key:
+            self._voice_state_cache[voice_key] = self._copy_state(state)
+            self._voice_state_cache.move_to_end(voice_key)
+            if len(self._voice_state_cache) > self._voice_state_cache_max:
+                self._voice_state_cache.popitem(last=False)
+        return state
+
     def _run_flow_lm(
         self,
         voice_embeddings: np.ndarray,
         text_ids: np.ndarray,
         max_frames: int = 500,
         frames_after_eos: int = 1,
+        voice_key: Optional[str] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Generator[np.ndarray, None, None]:
         """
         Run flow LM autoregressive generation, yielding latents.
@@ -381,20 +466,10 @@ class PocketTTSOnnx:
         if text_emb.ndim == 2:
             text_emb = text_emb[None]
 
-        # Initialize state for flow_lm_main
-        state = self._init_state(self.flow_lm_main)
-
         empty_seq = np.zeros((1, 0, 32), dtype=np.float32)
         empty_text = np.zeros((1, 0, 1024), dtype=np.float32)
 
-        # Voice conditioning pass
-        res_voice = self.flow_lm_main.run(None, {
-            "sequence": empty_seq,
-            "text_embeddings": voice_embeddings,
-            **state
-        })
-        self._update_state_from_outputs(state, res_voice, self.flow_lm_main)
-        # Note: Step counters are already updated in the model's output states
+        state = self._get_voice_conditioned_state(voice_key, voice_embeddings, empty_seq)
 
         # Text conditioning pass
         res_text = self.flow_lm_main.run(None, {
@@ -408,10 +483,12 @@ class PocketTTSOnnx:
         # Autoregressive generation
         curr = np.full((1, 1, 32), np.nan, dtype=np.float32)
         dt = 1.0 / self.lsd_steps
-        
+
         eos_step = None
 
         for step in range(max_frames):
+            if cancel_event is not None and cancel_event.is_set():
+                break
             # Run main model to get conditioning and EOS
             res_step = self.flow_lm_main.run(None, {
                 "sequence": curr,
@@ -428,7 +505,7 @@ class PocketTTSOnnx:
             # Check EOS - record when EOS is first detected
             if eos_logit[0][0] > self.eos_threshold and eos_step is None:
                 eos_step = step
-            
+
             # Stop only after frames_after_eos additional frames
             if eos_step is not None and step >= eos_step + frames_after_eos:
                 break
@@ -440,6 +517,8 @@ class PocketTTSOnnx:
 
             # Euler integration over flow network
             for j in range(self.lsd_steps):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 s_arr, t_arr = self._st_buffers[j]
                 flow_out = self.flow_lm_flow.run(None, {
                     "c": conditioning,
@@ -448,6 +527,8 @@ class PocketTTSOnnx:
                     "x": x
                 })
                 x = x + flow_out[0] * dt
+            if cancel_event is not None and cancel_event.is_set():
+                break
 
             latent = x.reshape(1, 1, 32)
             yield latent
@@ -503,6 +584,7 @@ class PocketTTSOnnx:
         Returns:
             Audio samples as numpy array (float32, 24kHz)
         """
+        voice_key = None if isinstance(voice, np.ndarray) else str(voice)
         voice_emb = self._get_voice_embeddings(voice)
         text_ids = self._tokenize(text)
 
@@ -517,100 +599,145 @@ class PocketTTSOnnx:
         decoder.start()
 
         # Generate latents and feed to decoder
-        for latent in self._run_flow_lm(voice_emb, text_ids, max_frames):
+        for latent in self._run_flow_lm(voice_emb, text_ids, max_frames, voice_key=voice_key):
             latent_queue.put(latent)
         latent_queue.put(None)  # sentinel
 
         decoder.join()
         return np.concatenate(audio_chunks)
 
+    def _stream_decode_worker(
+        self,
+        latent_queue: queue.Queue,
+        audio_queue: queue.Queue,
+        first_chunk_frames: int,
+        max_chunk_frames: int,
+        cancel_event: Optional[threading.Event] = None,
+    ):
+        """Decode streaming latents on a background thread."""
+        try:
+            mimi_state = self._init_state(self.mimi_decoder)
+            out_meta = self.mimi_decoder.get_outputs()
+            pending_latents = []
+            first = True
+            done = False
+
+            while not done:
+                item = latent_queue.get()
+                if item is None:
+                    done = True
+                else:
+                    pending_latents.append(item)
+
+                while not done:
+                    try:
+                        item = latent_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is None:
+                        done = True
+                    else:
+                        pending_latents.append(item)
+
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+
+                needed = first_chunk_frames if first else 1
+                while len(pending_latents) >= needed or (done and pending_latents):
+                    if cancel_event is not None and cancel_event.is_set():
+                        return
+                    chunk_size = min(len(pending_latents), max_chunk_frames)
+                    chunk = np.concatenate(pending_latents[:chunk_size], axis=1)
+                    del pending_latents[:chunk_size]
+                    res = self.mimi_decoder.run(None, {"latent": chunk, **mimi_state})
+                    for k in range(1, len(out_meta)):
+                        out_name = out_meta[k].name
+                        if out_name.startswith("out_state_"):
+                            idx = int(out_name.replace("out_state_", ""))
+                            mimi_state[f"state_{idx}"] = res[k]
+                    audio_queue.put(res[0].squeeze())
+                    first = False
+        except Exception as e:
+            audio_queue.put(e)
+        finally:
+            audio_queue.put(None)
+
     def stream(
         self,
         text: str,
         voice: Union[str, Path, np.ndarray],
         max_frames: int = 1500,
-        first_chunk_frames: int = 2,
-        target_buffer_sec: float = 0.2,
-        max_chunk_frames: int = 15,
+        first_chunk_frames: int = 1,
+        target_buffer_sec: Optional[float] = None,
+        max_chunk_frames: int = 12,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Generator[np.ndarray, None, None]:
         """
-        Stream audio generation with adaptive chunking.
+        Stream audio generation with pipelined decoding.
 
-        Yields audio chunks as they become available, optimizing for:
-        - Low TTFB (time to first audio)
-        - Smooth real-time playback
-        - High overall throughput
+        Flow-LM generation runs on the calling thread while the decoder runs
+        on a background thread. This lowers time-to-first-audio and reduces
+        underruns during rapid screen-reader speech.
 
         Args:
             text: Text to synthesize
             voice: Audio file path for voice cloning, or pre-computed embeddings
             max_frames: Maximum latent frames to generate
             first_chunk_frames: Frames in first chunk (controls TTFB)
-            target_buffer_sec: Target buffer ahead of playback
+            target_buffer_sec: Deprecated compatibility argument; ignored
             max_chunk_frames: Maximum frames per chunk
+            cancel_event: Optional event used to stop generation quickly
 
         Yields:
             Audio chunks as numpy arrays (float32, 24kHz)
         """
+        voice_key = None if isinstance(voice, np.ndarray) else str(voice)
         voice_emb = self._get_voice_embeddings(voice)
         text_ids = self._tokenize(text)
 
-        # State tracking
-        mimi_state = self._init_state(self.mimi_decoder)
-        # Pending latents waiting to be decoded. Entries are removed immediately
-        # after decoding so memory is freed as generation progresses rather than
-        # accumulating for the full duration of the utterance.
-        pending_latents = []
-        total_decoded_frames = 0
-        playback_start_time = None
-        start_time = time.time()
+        latent_queue = queue.Queue()
+        audio_queue = queue.Queue()
+        decoder = threading.Thread(
+            target=self._stream_decode_worker,
+            args=(latent_queue, audio_queue, first_chunk_frames, max_chunk_frames, cancel_event),
+            daemon=True,
+        )
+        decoder.start()
 
-        def _decode_chunk(size):
-            nonlocal total_decoded_frames, mimi_state, playback_start_time
-            chunk = np.concatenate(pending_latents[:size], axis=1)
-            # Free the decoded latents immediately to avoid accumulating all
-            # generated frames in memory (fix for memory leak on dynamic content).
-            del pending_latents[:size]
-            res = self.mimi_decoder.run(None, {"latent": chunk, **mimi_state})
-            audio = res[0].squeeze()
-            for k, val in enumerate(res[1:]):
-                mimi_state[f"state_{k}"] = val
-            total_decoded_frames += size
-            if playback_start_time is None:
-                playback_start_time = time.time() - start_time
-            return audio
+        decoder_finished = False
+        try:
+            for latent in self._run_flow_lm(
+                voice_emb,
+                text_ids,
+                max_frames,
+                voice_key=voice_key,
+                cancel_event=cancel_event,
+            ):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                latent_queue.put(latent)
+                while True:
+                    try:
+                        item = audio_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is None:
+                        decoder_finished = True
+                        return
+                    if isinstance(item, Exception):
+                        decoder_finished = True
+                        raise item
+                    yield item
+        finally:
+            latent_queue.put(None)
 
-        for latent in self._run_flow_lm(voice_emb, text_ids, max_frames):
-            pending_latents.append(latent)
-            pending = len(pending_latents)
-
-            chunk_size = 0
-
-            if playback_start_time is None:
-                # First chunk - minimise TTFB
-                if pending >= first_chunk_frames:
-                    chunk_size = first_chunk_frames
-            else:
-                elapsed = time.time() - start_time
-                audio_decoded_sec = total_decoded_frames * self.FRAME_DURATION
-                playback_elapsed = elapsed - playback_start_time
-                buffer_sec = audio_decoded_sec - playback_elapsed
-
-                if buffer_sec < target_buffer_sec and pending >= 1:
-                    # Buffer low - decode small chunk quickly
-                    chunk_size = min(pending, 3)
-                elif pending >= max_chunk_frames:
-                    chunk_size = max_chunk_frames
-
-            if chunk_size > 0:
-                yield _decode_chunk(chunk_size)
-
-        # Flush ALL remaining latents after generation ends.
-        # Critical: if max_frames was hit, or EOS fired just before a chunk
-        # boundary, any pending latents would be silently dropped without this,
-        # causing mid-sentence cut-off.
-        if pending_latents:
-            yield _decode_chunk(len(pending_latents))
+        while not decoder_finished:
+            item = audio_queue.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
 
     def save_audio(self, audio: np.ndarray, path: Union[str, Path]):
         """Save audio to file."""

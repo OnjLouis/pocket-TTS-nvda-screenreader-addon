@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pocket TTS for NVDA</title>
+</head>
+<body>
+<h1>Pocket TTS for NVDA</h1>
+<p>This is a personal maintained fork of the Pocket TTS NVDA add-on for NVDA 2026.1 and later. Pocket TTS provides neural English voices for NVDA using the Pocket TTS ONNX model. It includes bundled voices and can create new voice embeddings from short WAV or MP3 samples.</p>
+
+<h2>Using Pocket TTS</h2>
+<p>Select Pocket TTS from NVDA's synthesizer dialog. Choose a voice from NVDA's speech settings or synth settings ring.</p>
+
+<h2>Voice Manager</h2>
+<p>Open NVDA Settings and choose Pocket TTS Voice Manager to add, rename, or remove voices.</p>
+<ul>
+<li>Convert audio file creates a new voice embedding from the first 30 seconds of a WAV or MP3 file.</li>
+<li>Select voice chooses an installed voice.</li>
+<li>Display name edits the file name used for the selected voice.</li>
+<li>Rename voice file applies the new display name.</li>
+<li>Remove selected voice deletes the selected voice after confirmation.</li>
+</ul>
+
+<h2>Speech Settings</h2>
+<p>Flow steps controls how many model refinement passes are used while generating speech. Use 1 for the fastest response. Higher values may improve stability or quality for some voices, but can make speech slower.</p>
+
+<h2>Changelog</h2>
+<h3>Version 1.1.2</h3>
+<ul>
+<li>Improved responsiveness by caching voice-conditioning state and overlapping speech generation with audio decoding.</li>
+<li>Reduced lag and stale speech by removing blocking playback waits and tracking cancelled speech requests.</li>
+<li>Improved punctuation handling for single-character speech, including dash, comma, and similar symbols.</li>
+<li>Added Flow steps to NVDA's speech settings.</li>
+<li>Marked voices as English so NVDA can process characters and symbols more consistently.</li>
+<li>Improved the voice manager so converting a new voice no longer blocks NVDA.</li>
+<li>After creating a voice, the new voice is selected and the display-name field is focused for immediate renaming.</li>
+<li>Fixed duplicate mnemonics in the voice manager.</li>
+<li>Added multi-letter voice-list search with spoken feedback.</li>
+</ul>
+
+<h3>Version 1.1.1</h3>
+<ul>
+<li>NVDA 2026 compatibility update.</li>
+</ul>
+</body>
+</html>
