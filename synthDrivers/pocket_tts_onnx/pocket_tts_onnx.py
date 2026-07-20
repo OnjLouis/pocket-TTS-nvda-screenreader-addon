@@ -208,7 +208,7 @@ class PocketTTSOnnx:
 
     def set_lsd_steps(self, value: int):
         """Set flow matching steps and refresh precomputed buffers."""
-        self.lsd_steps = max(1, min(5, int(value)))
+        self.lsd_steps = max(1, min(10, int(value)))
         self._precompute_flow_buffers()
 
     def _init_state(self, session: ort.InferenceSession) -> dict:
@@ -405,6 +405,10 @@ class PocketTTSOnnx:
             # The model handles lower-case sentence starts fine.
 
         token_ids = self.tokenizer.Encode(text)
+        if not token_ids:
+            token_ids = self.tokenizer.Encode("symbol.")
+        if not token_ids:
+            raise ValueError("Text did not produce any model tokens")
         return np.array(token_ids, dtype=np.int64).reshape(1, -1)
 
     def _update_state_from_outputs(self, state: dict, result: list, session: ort.InferenceSession):

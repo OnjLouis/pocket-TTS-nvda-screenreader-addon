@@ -63,7 +63,12 @@ class _SynthQueueThread(threading.Thread):
             except Exception as e:
                 log.error(f"Pocket TTS ONNX: Synthesis error: {e}")
                 try:
-                    gen, _text, _voice_path, indices = request
+                    gen, segments, _voice_path = request
+                    indices = [
+                        index
+                        for _text, segment_indices in segments
+                        for index in segment_indices
+                    ]
                     self._notify_finished(gen, indices)
                 finally:
                     self.driver._request_queue.task_done()
@@ -81,67 +86,61 @@ class _SynthQueueThread(threading.Thread):
 
     def _process_request(self, request):
         driver = self.driver
-        gen, text, voice_path, indices = request
+        gen, segments, voice_path = request
         if gen != driver._speech_gen:
             return
 
         self.cancel_event.clear()
         if gen != driver._speech_gen or self.cancel_event.is_set() or not driver.tts_engine:
+            indices = [
+                index
+                for _text, segment_indices in segments
+                for index in segment_indices
+            ]
             self._notify_finished(gen, indices)
             return
 
-        tracker = {"final": None, "played": 0, "fired": False}
-        lock = threading.Lock()
+        def fire_notifications(indices, done=False):
+            if gen != driver._speech_gen:
+                return
+            for index in indices:
+                synthIndexReached.notify(synth=driver, index=index)
+            if done:
+                synthDoneSpeaking.notify(synth=driver)
 
-        def make_on_done(seq):
-            def on_done():
-                if gen != driver._speech_gen:
-                    return
-                with lock:
-                    if seq > tracker["played"]:
-                        tracker["played"] = seq
-                    if tracker["final"] is None or tracker["played"] < tracker["final"] or tracker["fired"]:
-                        return
-                    tracker["fired"] = True
-                self._notify_finished(gen, indices)
-            return on_done
+        volume_factor = driver._volume / 100.0
+        last_segment = len(segments) - 1
+        for segment_number, (text, indices) in enumerate(segments):
+            is_last = segment_number == last_segment
+            fed_audio = False
+            if text and text.strip():
+                audio_stream = driver.tts_engine.stream(
+                    text=text,
+                    voice=voice_path,
+                    target_buffer_sec=0.2,
+                    cancel_event=self.cancel_event,
+                )
 
-        fed = 0
-        if text and text.strip():
-            audio_stream = driver.tts_engine.stream(
-                text=text,
-                voice=voice_path,
-                target_buffer_sec=0.2,
-                cancel_event=self.cancel_event,
-            )
-            volume_factor = driver._volume / 100.0
+                for chunk in audio_stream:
+                    if self.cancel_event.is_set() or gen != driver._speech_gen:
+                        break
+                    if chunk is not None and driver._player:
+                        pcm = np.asarray(np.clip(chunk * volume_factor, -1.0, 1.0))
+                        if pcm.size == 0:
+                            continue
+                        driver._player.feed(
+                            (pcm * 32767).astype(np.int16).tobytes(),
+                        )
+                        fed_audio = True
 
-            for chunk in audio_stream:
-                if self.cancel_event.is_set() or gen != driver._speech_gen:
-                    break
-                if chunk is not None and driver._player:
-                    pcm = np.clip(chunk * volume_factor, -1.0, 1.0)
-                    fed += 1
-                    driver._player.feed(
-                        (pcm * 32767).astype(np.int16).tobytes(),
-                        onDone=make_on_done(fed),
-                    )
+            if self.cancel_event.is_set() or gen != driver._speech_gen:
+                return
 
-        if self.cancel_event.is_set() or gen != driver._speech_gen:
-            return
-
-        if fed == 0:
-            self._notify_finished(gen, indices)
-            return
-
-        fire_now = False
-        with lock:
-            tracker["final"] = fed
-            if tracker["played"] >= fed and not tracker["fired"]:
-                tracker["fired"] = True
-                fire_now = True
-        if fire_now:
-            self._notify_finished(gen, indices)
+            if fed_audio and (indices or is_last):
+                driver._player.idle()
+            if self.cancel_event.is_set() or gen != driver._speech_gen:
+                return
+            fire_notifications(indices, is_last)
 
 
 # =========================================================================
@@ -176,7 +175,7 @@ class SynthDriver(BaseSynthDriver):
         self._current_voice_path = None  # str path passed directly to the engine
         self._volume = 80
         self._eos_threshold = -2.0
-        self._lsd_steps = 1
+        self._lsd_steps = 10
         self.tts_engine = None
         self._player = None
         self._available_voices = OrderedDict()
@@ -207,8 +206,11 @@ class SynthDriver(BaseSynthDriver):
             # Translators: Label for the Pocket TTS flow matching step setting in NVDA speech settings
             _("Flow steps"),
             availableInSettingsRing=True,
+            defaultVal=10,
             minVal=1,
-            maxVal=5,
+            maxVal=10,
+            normalStep=1,
+            largeStep=2,
         ),
     )
 
@@ -250,7 +252,7 @@ class SynthDriver(BaseSynthDriver):
                 bitsPerSample=16,
                 purpose=AudioPurpose.SPEECH,
             )
-            # lsd_steps=1 is the recommended default for real-time use (see ONNX README).
+            # Start with the model's full-quality flow setting.
             self.tts_engine = PocketTTSOnnx(
                 models_dir=self.models_dir,
                 tokenizer_path=self.tokenizer_path,
@@ -307,44 +309,38 @@ class SynthDriver(BaseSynthDriver):
         return self._lsd_steps
 
     def _set_lsdSteps(self, value):
-        self._lsd_steps = max(1, min(5, int(value)))
+        self._lsd_steps = max(1, min(10, int(value)))
         if self.tts_engine is not None:
             self.tts_engine.set_lsd_steps(self._lsd_steps)
 
     # --- Speech ---
 
     def speak(self, speechSequence):
-        """Process a speech sequence, supporting IndexCommands for 'Read All'.
-
-        NVDA injects IndexCommand objects into the sequence at arbitrary points
-        — including mid-phrase (e.g. between "check" and "her notifications").
-        Splitting on every IndexCommand and sending each fragment as a separate
-        TTS request causes the model to treat each fragment as a new sentence,
-        resetting prosody and intonation mid-utterance.
-
-        Instead we collect ALL text across the entire sequence into one request
-        and carry the *list* of (char_offset, index) pairs alongside it. The
-        worker thread fires each synthIndexReached signal after the audio for
-        its corresponding text position has been fed to the player.
-        """
+        """Queue text in index-aligned segments for spelling and Say All."""
         if not self._engine_loaded_event.is_set() or self._current_voice_path is None:
             return
 
+        segments = []
         text_parts = []
-        # List of (index_value,) collected in order; all fired after audio done.
-        pending_indices = []
 
         for item in speechSequence:
             if isinstance(item, str):
                 text_parts.append(item)
             elif isinstance(item, IndexCommand):
-                pending_indices.append(item.index)
+                text = "".join(text_parts)
+                if text or not segments:
+                    segments.append((text, [item.index]))
+                else:
+                    segments[-1][1].append(item.index)
+                text_parts.clear()
             elif isinstance(item, VolumeCommand):
                 self._volume = item.value
 
-        full_text = "".join(text_parts)
-        if full_text.strip() or pending_indices:
-            self._request_queue.put((self._speech_gen, full_text, self._current_voice_path, pending_indices))
+        trailing_text = "".join(text_parts)
+        if trailing_text.strip() or not segments:
+            segments.append((trailing_text, []))
+        if any(text.strip() or indices for text, indices in segments):
+            self._request_queue.put((self._speech_gen, segments, self._current_voice_path))
 
     def pause(self, switch):
         """Pause or resume playback. Called by NVDA when the user presses Shift."""
